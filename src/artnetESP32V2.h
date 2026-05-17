@@ -73,6 +73,15 @@ public:
   uint8_t nbBufferled;
   uint8_t *data;
   int previousUniverse;
+  // Adaptive end-of-frame detection: observedEnd is the universe number that
+  // ended the previous full frame. When the next frame's universes reach
+  // observedEnd, we flush immediately (no waiting for next start universe).
+  // highestSeenThisFrame tracks every universe in the current frame, even
+  // ones we drop after early-flushing, so it captures sender growth too.
+  // Both initialise to startUniverse-1 in _initialize() — a sentinel that
+  // never matches an incoming universe.
+  int observedEnd;
+  int highestSeenThisFrame;
   size_t len;
   size_t tmp_len;
   bool subartnetglag;
@@ -98,121 +107,89 @@ public:
 
 void handleUniverse(lwip_event_packet_t *e)
 {
-    if(e->universe == startUniverse)
+    if (e->universe == startUniverse)
     {
-        
-        offset = buffers[currentframenumber];
-                  #if  CORE_DEBUG_LEVEL>=2
-        if (new_frame == false)
+        // If a frame is still in progress (sender shrank universe count),
+        // flush it before starting the new one. Steady-state senders won't
+        // hit this path because the early flush below already cleared
+        // new_frame at observedEnd.
+        if (new_frame)
         {
-            nb_frames_lost++;
+            uint8_t *data = buffers[currentframenumber];
+            currentframenumber = (currentframenumber + 1) % nbOfBuffers;
+            offset = buffers[currentframenumber];
+            new_frame = false;
+
+            #ifdef _USING_QUEUES
+                if (xQueueSend(_show_queue[subArtnetNum], &data, 0) != pdTRUE)
+                {
+                    nb_frames_lost++;
+                }
+            #else
+                nb_frames++;
+                if (frameCallback)
+                    frameCallback((void *)this);
+            #endif
         }
-        #endif 
+
+        // Adapt observedEnd from what we saw in the previous frame.
+        // highestSeenThisFrame keeps tracking after an early flush, so this
+        // captures sender growth (4 -> 8 universes) on the next frame.
+        if (highestSeenThisFrame >= startUniverse)
+        {
+            observedEnd = highestSeenThisFrame;
+            if (observedEnd > endUniverse - 1) observedEnd = endUniverse - 1;
+        }
+        highestSeenThisFrame = startUniverse - 1;
+
+        // Start new frame — fall through so the startUniverse payload itself
+        // gets copied by the block below (it matches previousUniverse + 1).
+        offset = buffers[currentframenumber];
         new_frame = true;
-        #if _SYNC_FRAME_ == FRAME_START
-        if(frame_disp)
-        {
-
-                data =  buffers[currentframenumber];
-        currentframenumber = (currentframenumber + 1) % nbOfBuffers;
-        offset = buffers[currentframenumber];
-            frame_disp= false;
-            
-             #ifdef  _USING_QUEUES
-
-                xQueueSend(_show_queue[subArtnetNum], &data, portMAX_DELAY);
-            
-          #else 
-          
-            nb_frames++;
-           if (frameCallback)
-           {
-            //if(subartnetglag)
-                frameCallback((void *)this);
-           // else
-            //frameCallback((void*)data);
-
-           }
-               #if CORE_DEBUG_LEVEL>=2
-                    if ((nb_frames) % NB_FRAMES_DELTA == 0)
-                    {
-                        time2 =millis();
-                        ESP_LOGI("ARTNETESP32", "SUBARTNET:%d frames fully received:%d frames lost:%d  delta:%d percentage lost:%.2f  fps: %.2f ", subArtnetNum, nb_frames, nb_frames_lost - 1, nb_frames_lost - previous_lost, (float)(100 * (nb_frames_lost - 1)) / (nb_frames_lost + nb_frames - 1), (float)(1000 * NB_FRAMES_DELTA / ((time2 - time1) / 1)));
-                        time1 = time2;
-                        previous_lost = nb_frames_lost;
-                    }
-                #endif
-            
-            #endif
-            
-        }
-        #endif
         previousUniverse = startUniverse - 1;
-        
     }
-    if(!new_frame)
+
+    // Track every universe we see this frame, even after an early flush —
+    // that's how we learn about growth (sender went from 4 to 8 universes).
+    if (e->universe > highestSeenThisFrame)
     {
-        return;
+        highestSeenThisFrame = e->universe;
     }
-    if (e->universe  == previousUniverse + 1)
+
+    if (!new_frame) return;
+
+    if (e->universe == previousUniverse + 1)
     {
-       
-            previousUniverse++;
-        memcpy(offset, e->pb->payload , e->pb->len);
+        previousUniverse++;
+        memcpy(offset, e->pb->payload, e->pb->len);
         offset += e->pb->len;
-            if (e->universe  == endUniverse - 1)
-            {
-                // nb_frames++;
-                //memset(data+_nb_data+3,10,3);
-                
 
-                #if _SYNC_FRAME_ == FRAME_END
-    
-                data =  buffers[currentframenumber];
-        currentframenumber = (currentframenumber + 1) % nbOfBuffers;
-        offset = buffers[currentframenumber];
-           // frame_disp= false;
-            
-             #ifdef  _USING_QUEUES
+        // Flush on adaptive observedEnd (zero-latency for steady senders)
+        // or on the configured hard cap (catches the very first frame
+        // before observedEnd has been learned).
+        if (e->universe == observedEnd || e->universe == endUniverse - 1)
+        {
+            data = buffers[currentframenumber];
+            currentframenumber = (currentframenumber + 1) % nbOfBuffers;
+            offset = buffers[currentframenumber];
+            new_frame = false;
 
-                xQueueSend(_show_queue[subArtnetNum], &data, portMAX_DELAY);
-            
-          #else 
-          
-            nb_frames++;
-           if (frameCallback)
-           {
-            //if(subartnetglag)
-                frameCallback((void *)this);
-           // else
-            //frameCallback((void*)data);
-
-           }
-               #if CORE_DEBUG_LEVEL>=2
-                    if ((nb_frames) % NB_FRAMES_DELTA == 0)
-                    {
-                        time2 =millis();
-                        ESP_LOGI("ARTNETESP32", "SUBARTNET:%d frames fully received:%d frames lost:%d  delta:%d percentage lost:%.2f  fps: %.2f ", subArtnetNum, nb_frames, nb_frames_lost - 1, nb_frames_lost - previous_lost, (float)(100 * (nb_frames_lost - 1)) / (nb_frames_lost + nb_frames - 1), (float)(1000 * NB_FRAMES_DELTA / ((time2 - time1) / 1)));
-                        time1 = time2;
-                        previous_lost = nb_frames_lost;
-                    }
-                #endif
-            
+            #ifdef _USING_QUEUES
+                if (xQueueSend(_show_queue[subArtnetNum], &data, 0) != pdTRUE)
+                {
+                    nb_frames_lost++;
+                }
+            #else
+                nb_frames++;
+                if (frameCallback)
+                    frameCallback((void *)this);
             #endif
-          
-        
-        #else
-        frame_disp=true;
-        #endif
-
-            }
-        
+        }
     }
     else
     {
         new_frame = false;
     }
-
 }
 
   uint8_t *getData();
@@ -432,6 +409,7 @@ static void _udp_task_subrarnet_handle(void *pvParameters)
              #if CORE_DEBUG_LEVEL>=2
             t1=ESP.getCycleCount();
            #endif
+            subartnet->data = data;
             subartnet->nb_frames++;
             if (subartnet->frameCallback)
                 //subartnet->frameCallback(data);

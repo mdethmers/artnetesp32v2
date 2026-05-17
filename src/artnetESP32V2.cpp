@@ -222,6 +222,9 @@ void subArtnet::_initialize(int star_universe, uint32_t nb_data, uint32_t nb_dat
 
     nbDataPerUniverse = nb_data_per_universe;
     startUniverse = star_universe;
+    // Sentinels: never match a real incoming universe (which is >= startUniverse).
+    observedEnd = star_universe - 1;
+    highestSeenThisFrame = star_universe - 1;
     nbNeededUniverses = nb_data / nbDataPerUniverse;
     if (nbNeededUniverses * nbDataPerUniverse < nb_data)
     {
