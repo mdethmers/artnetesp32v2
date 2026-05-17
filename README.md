@@ -7,6 +7,15 @@ Previous behaviour: Set 16 universes > Only receives 15 universes > new frame ar
 
 New behaviour: Set 16 universes > Only receives 15 universes > new frame arrives with universe 0 > learns that only 15 universes are send > next frame 15 universes arrive > push data to pixels.
 
+Expected behavior:
+
+Sender state	Latency
+First frame ever	Falls back to endUniverse-1 (full frame) or one-frame delay (partial)
+Steady N universes	Zero — flushes at u == observedEnd immediately
+Growth (4 → 8)	One transition frame shows only first 4; from frame 2 onward zero latency
+Shrink (8 → 4)	One transition frame delayed by next-start auto-flush; from frame 2 onward zero latency
+
+
 
 ## artnetesp32v2 new version of the artnetesp32 library
 Here is a new take on the artnet library the code is still in its infancy. The inspiration is the new aSyncUDP and the new udp_bind technique available in the new espressif core.
