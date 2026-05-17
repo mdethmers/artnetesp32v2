@@ -1,9 +1,11 @@
 Original repo:https://github.com/hpwit/artnetesp32v2
 
-Modified to support adaptive universe recognition. Now outputs directly when a full frame of data is received, instead of waiting for the number of universes set in the config. This would result in no data shown on the leds becausde the end universe number would never be reached 
+Modified to support adaptive universe recognition. Now outputs directly when a full frame of data is received, instead of waiting for the number of universes set in the config. This would result in no data shown on the leds becausde the end universe number would never be reached. 
 
-Previous behaviour: Set 16 universes > Only receives 15 universes > new frame arrives with universe 0 > never reached uni 16 > No data pushed to leds
-New behaviour: Set 16 universes > Only receives 15 universes > new frame arrives with universe 0 > learns that only 15 universes are send > next frame 15 universes arrive > push data to pixels
+Previous behaviour: Set 16 universes > Only receives 15 universes > new frame arrives with universe 0 > never reached uni 16 > No data pushed to leds.
+
+
+New behaviour: Set 16 universes > Only receives 15 universes > new frame arrives with universe 0 > learns that only 15 universes are send > next frame 15 universes arrive > push data to pixels.
 
 
 ## artnetesp32v2 new version of the artnetesp32 library
