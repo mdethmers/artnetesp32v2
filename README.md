@@ -9,11 +9,11 @@ New behaviour: Set 16 universes > Only receives 15 universes > new frame arrives
 
 Expected behavior:
 
-Sender state	Latency
-First frame ever	Falls back to endUniverse-1 (full frame) or one-frame delay (partial)
-Steady N universes	Zero — flushes at u == observedEnd immediately
-Growth (4 → 8)	One transition frame shows only first 4; from frame 2 onward zero latency
-Shrink (8 → 4)	One transition frame delayed by next-start auto-flush; from frame 2 onward zero latency
+Sender state >  Latency\
+First frame ever > Falls back to endUniverse-1 (full frame) or one-frame delay (partial)\
+Steady N universes > Zero — flushes at u == observedEnd immediately\
+Growth (4 → 8) > One transition frame shows only first 4; from frame 2 onward zero latency\
+Shrink (8 → 4) > One transition frame delayed by next-start auto-flush; from frame 2 onward zero latency\
 
 
 
