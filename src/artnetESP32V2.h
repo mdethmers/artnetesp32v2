@@ -30,6 +30,7 @@ typedef struct
 {
     pbuf *pb;
     int universe;
+    bool isSacn;
 } lwip_event_packet_t;
 
 #define ART_DMX_START    18
@@ -116,7 +117,7 @@ public:
   // ── Universe handler (called from the UDP task) ───────────────────────────
   void handleUniverse(lwip_event_packet_t *e)
   {
-    Serial.printf("sACN handleUniverse subart=%d start=%d end=%d recv=%d len=%u new_frame=%d prev=%d highestSeen=%d\n",
+     ESP_LOGW("sACN handleUniverse subart=%d start=%d end=%d recv=%d len=%u new_frame=%d prev=%d highestSeen=%d\n",
                   subArtnetNum, startUniverse, endUniverse, e->universe,
                   (unsigned)e->pb->len, new_frame, previousUniverse,
                   highestSeenThisFrame);
@@ -184,8 +185,8 @@ public:
     }
     else
     {
-      Serial.printf("sACN universe mismatch subart=%d got=%d expected=%d\n",
-                    subArtnetNum, e->universe, previousUniverse + 1);
+      ESP_LOGW("sACN", "universe mismatch subart=%d got=%d expected=%d\n",
+                subArtnetNum, e->universe, previousUniverse + 1);
       new_frame = false;
     }
   }
@@ -337,7 +338,10 @@ static void _udp_task_subrarnet(void *pvParameters)
     {
       if (!e->pb) { free((void *)e); continue; }
 
-      e->pb->payload = (uint8_t *)e->pb->payload + ART_DMX_START;
+      if (!e->isSacn)
+      {
+        e->pb->payload = (uint8_t *)e->pb->payload + ART_DMX_START;
+      }
 
       #ifndef UNIQUE_SUBARTNET
       for (int i = 0; i < artnet->numSubArtnet; i++)
@@ -346,17 +350,35 @@ static void _udp_task_subrarnet(void *pvParameters)
         if (s->startUniverse <= e->universe &&
             (s->endUniverse - 1) >= e->universe)
         {
-          e->pb->len = (e->pb->len - ART_DMX_START < (uint16_t)s->nbDataPerUniverse)
-                     ? (e->pb->len - ART_DMX_START)
-                     : (uint16_t)s->nbDataPerUniverse;
+          if (e->isSacn)
+          {
+            e->pb->len = (e->pb->len < (uint16_t)s->nbDataPerUniverse)
+                       ? e->pb->len
+                       : (uint16_t)s->nbDataPerUniverse;
+          }
+          else
+          {
+            e->pb->len = (e->pb->len - ART_DMX_START < (uint16_t)s->nbDataPerUniverse)
+                       ? (e->pb->len - ART_DMX_START)
+                       : (uint16_t)s->nbDataPerUniverse;
+          }
           s->handleUniverse(e);
         }
       }
       #else
       subArtnet *s = artnet->subArtnets[0];
-      e->pb->len = (e->pb->len - ART_DMX_START < (uint16_t)s->nbDataPerUniverse)
-                 ? (e->pb->len - ART_DMX_START)
-                 : (uint16_t)s->nbDataPerUniverse;
+      if (e->isSacn)
+      {
+        e->pb->len = (e->pb->len < (uint16_t)s->nbDataPerUniverse)
+                   ? e->pb->len
+                   : (uint16_t)s->nbDataPerUniverse;
+      }
+      else
+      {
+        e->pb->len = (e->pb->len - ART_DMX_START < (uint16_t)s->nbDataPerUniverse)
+                   ? (e->pb->len - ART_DMX_START)
+                   : (uint16_t)s->nbDataPerUniverse;
+      }
       s->handleUniverse(e);
       #endif
 
