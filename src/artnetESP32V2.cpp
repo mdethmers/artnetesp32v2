@@ -110,7 +110,7 @@ static err_t _udp_bind(struct udp_pcb *pcb, const ip_addr_t *addr, u16_t port)
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared queue post helper — used by both ArtNet and sACN receive callbacks
 // ─────────────────────────────────────────────────────────────────────────────
-static bool _udp_task_post(pbuf *pb, int universe)
+static bool _udp_task_post(pbuf *pb, int universe, bool isSacn = false)
 {
   if (!_udp_task_handle || !_udp_queue) return false;
 
@@ -120,9 +120,14 @@ static bool _udp_task_post(pbuf *pb, int universe)
 
   e->pb       = pb;
   e->universe = universe;
+  e->isSacn   = isSacn;
 
-  if (xQueueSend(_udp_queue, &e, portMAX_DELAY) != pdPASS)
+  // Do not block the UDP receive callback; if the queue is full, drop packets.
+  if (xQueueSend(_udp_queue, &e, 0) != pdPASS)
   {
+    ESP_LOGW("ARTNETESP32", "UDP queue full, dropping packet universe=%d len=%u",
+             universe, pb ? pb->len : 0);
+    if (pb) pbuf_free(pb);
     free((void *)e);
     return false;
   }
@@ -283,7 +288,7 @@ static void _sacn_recv(void *arg, udp_pcb *pcb, pbuf *pb,
       continue;
     }
 
-    if (!_udp_task_post(this_pb, normalisedUniverse))
+    if (!_udp_task_post(this_pb, normalisedUniverse, true))
     {
       ESP_LOGI("ARTNETESP32", "sACN RX failed to post universe=%d len=%u",
               normalisedUniverse, this_pb->len);
