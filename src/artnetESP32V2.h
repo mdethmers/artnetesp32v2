@@ -117,7 +117,7 @@ public:
   // ── Universe handler (called from the UDP task) ───────────────────────────
   void handleUniverse(lwip_event_packet_t *e)
   {
-     ESP_LOGW("sACN handleUniverse subart=%d start=%d end=%d recv=%d len=%u new_frame=%d prev=%d highestSeen=%d\n",
+     ESP_LOGI("ARTNETESP32", "sACN handleUniverse subart=%d start=%d end=%d recv=%d len=%u new_frame=%d prev=%d highestSeen=%d",
                   subArtnetNum, startUniverse, endUniverse, e->universe,
                   (unsigned)e->pb->len, new_frame, previousUniverse,
                   highestSeenThisFrame);
@@ -320,7 +320,7 @@ public:
 // ─────────────────────────────────────────────────────────────────────────────
 static void _udp_task_subrarnet(void *pvParameters)
 {
-  lwip_event_packet_t *e = NULL;
+  lwip_event_packet_t e;
   ESP_LOGI("ARTNETESP32", "Start listening task");
   artnetESP32V2 *artnet = (artnetESP32V2 *)pvParameters;
 
@@ -336,54 +336,53 @@ static void _udp_task_subrarnet(void *pvParameters)
   {
     if (xQueueReceive(_udp_queue, &e, portMAX_DELAY) == pdTRUE)
     {
-      if (!e->pb) { free((void *)e); continue; }
+      if (!e.pb) continue;
 
-      if (!e->isSacn)
+      if (!e.isSacn)
       {
-        e->pb->payload = (uint8_t *)e->pb->payload + ART_DMX_START;
+        e.pb->payload = (uint8_t *)e.pb->payload + ART_DMX_START;
       }
 
       #ifndef UNIQUE_SUBARTNET
       for (int i = 0; i < artnet->numSubArtnet; i++)
       {
         subArtnet *s = artnet->subArtnets[i];
-        if (s->startUniverse <= e->universe &&
-            (s->endUniverse - 1) >= e->universe)
+        if (s->startUniverse <= e.universe &&
+            (s->endUniverse - 1) >= e.universe)
         {
-          if (e->isSacn)
+          if (e.isSacn)
           {
-            e->pb->len = (e->pb->len < (uint16_t)s->nbDataPerUniverse)
-                       ? e->pb->len
+            e.pb->len = (e.pb->len < (uint16_t)s->nbDataPerUniverse)
+                       ? e.pb->len
                        : (uint16_t)s->nbDataPerUniverse;
           }
           else
           {
-            e->pb->len = (e->pb->len - ART_DMX_START < (uint16_t)s->nbDataPerUniverse)
-                       ? (e->pb->len - ART_DMX_START)
+            e.pb->len = (e.pb->len - ART_DMX_START < (uint16_t)s->nbDataPerUniverse)
+                       ? (e.pb->len - ART_DMX_START)
                        : (uint16_t)s->nbDataPerUniverse;
           }
-          s->handleUniverse(e);
+          s->handleUniverse(&e);
         }
       }
       #else
       subArtnet *s = artnet->subArtnets[0];
-      if (e->isSacn)
+      if (e.isSacn)
       {
-        e->pb->len = (e->pb->len < (uint16_t)s->nbDataPerUniverse)
-                   ? e->pb->len
+        e.pb->len = (e.pb->len < (uint16_t)s->nbDataPerUniverse)
+                   ? e.pb->len
                    : (uint16_t)s->nbDataPerUniverse;
       }
       else
       {
-        e->pb->len = (e->pb->len - ART_DMX_START < (uint16_t)s->nbDataPerUniverse)
-                   ? (e->pb->len - ART_DMX_START)
+        e.pb->len = (e.pb->len - ART_DMX_START < (uint16_t)s->nbDataPerUniverse)
+                   ? (e.pb->len - ART_DMX_START)
                    : (uint16_t)s->nbDataPerUniverse;
       }
-      s->handleUniverse(e);
+      s->handleUniverse(&e);
       #endif
 
-      pbuf_free(e->pb);
-      free((void *)e);
+      pbuf_free(e.pb);
     }
   }
   _udp_task_handle = NULL;
@@ -457,7 +456,7 @@ static bool _udp_task_start(artnetESP32V2 *p)
 {
   if (!_udp_queue)
   {
-    _udp_queue = xQueueCreate(128, sizeof(lwip_event_packet_t *));
+    _udp_queue = xQueueCreate(128, sizeof(lwip_event_packet_t));
     if (!_udp_queue) return false;
   }
   for (int i = 0; i < p->numSubArtnet; i++)
