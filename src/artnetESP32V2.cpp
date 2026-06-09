@@ -114,13 +114,10 @@ static bool _udp_task_post(pbuf *pb, int universe, bool isSacn = false)
 {
   if (!_udp_task_handle || !_udp_queue) return false;
 
-  lwip_event_packet_t *e =
-      (lwip_event_packet_t *)malloc(sizeof(lwip_event_packet_t));
-  if (!e) return false;
-
-  e->pb       = pb;
-  e->universe = universe;
-  e->isSacn   = isSacn;
+  lwip_event_packet_t e;
+  e.pb       = pb;
+  e.universe = universe;
+  e.isSacn   = isSacn;
 
   // Do not block the UDP receive callback; if the queue is full, drop packets.
   if (xQueueSend(_udp_queue, &e, 0) != pdPASS)
@@ -128,7 +125,6 @@ static bool _udp_task_post(pbuf *pb, int universe, bool isSacn = false)
     ESP_LOGW("ARTNETESP32", "UDP queue full, dropping packet universe=%d len=%u",
              universe, pb ? pb->len : 0);
     if (pb) pbuf_free(pb);
-    free((void *)e);
     return false;
   }
   return true;
