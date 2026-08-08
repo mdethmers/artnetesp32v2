@@ -3,10 +3,23 @@
 #define ARTNET_ETHERNET 0x001
 #define ARTNET_ETH 0x002
 #define ARTNET_WIFI 0x004
-#ifndef ARTNET_CONNECT_MODE 
+// ARTNET_CONNECT_MODE is no longer used to pick the interface — poll_reply()
+// now chooses at runtime. The defines stay so sketches that set them still
+// compile.
+#ifndef ARTNET_CONNECT_MODE
 #define ARTNET_CONNECT_MODE ARTNET_WIFI
 #endif
    #include "string.h"
+
+// Pull in the W5500 Ethernet object when the sketch has that library, so the
+// reply can report the Ethernet address. Absent it, WiFi and soft-AP are used.
+// This is the declaration-only header on purpose — WebServer_ESP32_W5500.h is
+// header-only and defines its helpers, so including it here as well as in the
+// sketch produces duplicate symbols at link time.
+#if __has_include(<w5500/esp32_w5500.h>)
+  #include <w5500/esp32_w5500.h>
+  #define ARTNET_HAVE_W5500 1
+#endif
     constexpr uint16_t DEFAULT_PORT {6454};  // 0x1936
 
     constexpr uint16_t PROTOCOL_VER {14}; // 0x000E
@@ -68,21 +81,24 @@ void poll_reply(udp_pcb *pcb,const ip_addr_t *addr) {
             for (size_t i = 0; i < ID_LENGTH; i++) r.id[i] = static_cast<uint8_t>(ID[i]);
             r.op_code_l = 0 ; //((uint16_t)OpCode::PollReply >> 0) & 0x00FF;
             r.op_code_h = 0x21; //((uint16_t)OpCode::PollReply >> 8) & 0x00FF;
-            #if ARTNET_CONNECT_MODE == ARTNET_ETHERNET
-                        IPAddress my_ip = Ethernet.localIP();
-            IPAddress my_subnet = Ethernet.subnetMask();
-             Ethernet.macAddress(r.mac);
-            #endif
-            #if ARTNET_CONNECT_MODE == ARTNET_ETH
-            IPAddress my_ip = ETH.localIP();
-            IPAddress my_subnet = ETH.subnetMask();
-             ETH.macAddress(r.mac);
-             #endif
-          #if ARTNET_CONNECT_MODE == ARTNET_WIFI
+            // Report whichever interface actually holds an address. This used
+            // to be the compile-time ARTNET_CONNECT_MODE switch, which defaults
+            // to WiFi — so a node running on Ethernet advertised 0.0.0.0 and
+            // the wrong MAC in every reply.
             IPAddress my_ip = WiFi.localIP();
-            IPAddress my_subnet = WiFi.subnetMask();
-             WiFi.macAddress(r.mac);
-             #endif
+            WiFi.macAddress(r.mac);
+
+            #ifdef ARTNET_HAVE_W5500
+            if ((uint32_t)my_ip == 0) {
+              my_ip = ETH.localIP();
+              ETH.macAddress(r.mac);
+            }
+            #endif
+
+            if ((uint32_t)my_ip == 0) {   // soft-AP is the last resort
+              my_ip = WiFi.softAPIP();
+              WiFi.softAPmacAddress(r.mac);
+            }
             for (size_t i = 0; i < 4; ++i) r.ip[i] = my_ip[i];
             r.port_l = (DEFAULT_PORT >> 0) & 0xFF;
             r.port_h = (DEFAULT_PORT >> 8) & 0xFF;
@@ -97,9 +113,15 @@ void poll_reply(udp_pcb *pcb,const ip_addr_t *addr) {
             memset(r.short_name, 0, 18);
             memset(r.long_name, 0, 64);
             memset(r.node_report, 0, 64);
-            memcpy(r.short_name, short_name.c_str(), short_name.length());
-            memcpy(r.long_name, long_name.c_str(), long_name.length());
-            memcpy(r.node_report, node_report.c_str(), node_report.length());
+            // Clamp to the field size (leaving room for the terminator) — a
+            // node name longer than the field would otherwise run over the
+            // fields that follow it in the reply.
+            memcpy(r.short_name, short_name.c_str(),
+                   short_name.length() < 17 ? short_name.length() : 17);
+            memcpy(r.long_name, long_name.c_str(),
+                   long_name.length() < 63 ? long_name.length() : 63);
+            memcpy(r.node_report, node_report.c_str(),
+                   node_report.length() < 63 ? node_report.length() : 63);
             r.num_ports_h = 0;                 // Reserved
             r.num_ports_l = 4;//(callbacks.size() > NUM_POLLREPLY_PUBLIC_PORT_LIMIT) ? NUM_POLLREPLY_PUBLIC_PORT_LIMIT : callbacks.size();
             memset(r.sw_in, 0, 4);
