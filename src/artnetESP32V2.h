@@ -312,6 +312,18 @@ public:
 
   void setNodeName(String s);
 
+  // ── Node discovery ────────────────────────────────────────────────────────
+  // Register a handler for every ArtPollReply seen on the wire. It runs in the
+  // lwIP receive context, so it must be short: no Serial, no blocking calls.
+  // pkt points at the raw reply (short_name at offset 26, long_name at 44);
+  // srcIp is the sender's IPv4 address in network byte order.
+  void setPollReplyCallback(void (*fptr)(const uint8_t *pkt, uint16_t len,
+                                         uint32_t srcIp));
+
+  // Broadcast an ArtPoll so every node on the segment announces itself.
+  // Safe to call from loop(); the send is marshalled onto the tcpip thread.
+  bool sendArtPoll();
+
   subArtnet *subArtnets[MAX_SUBARTNET];
 };
 
