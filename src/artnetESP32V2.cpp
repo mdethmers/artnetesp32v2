@@ -130,6 +130,11 @@ static bool _udp_task_post(pbuf *pb, int universe, bool isSacn = false)
   return true;
 }
 
+// Set by the sketch to receive ArtPollReply packets for node discovery.
+// Invoked from the lwIP receive context — handlers must be short and must not
+// block or write to Serial.
+static void (*_poll_reply_cb)(const uint8_t *pkt, uint16_t len, uint32_t srcIp) = NULL;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ArtNet receive callback (port 6454)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -142,14 +147,29 @@ static void _udp_recv(void *arg, udp_pcb *pcb, pbuf *pb,
     pb             = pb->next;
     this_pb->next  = NULL;
 
-    // ArtPoll reply (opcode 0x2100 at word offset 4, little-endian)
-    if (*((uint16_t *)(this_pb->payload) + 4) == 0x2100)
+    // Opcode sits at bytes 8-9, little-endian, straight after the 8-byte ID.
+    uint16_t opcode = *((uint16_t *)(this_pb->payload) + 4);
+
+    // ArtPoll (0x2000) — a controller or another node asking who is here
+    if (opcode == 0x2000)
     {
       poll_reply(pcb, addr);
       pbuf_free(this_pb);
     }
+    // ArtPollReply (0x2100) — somebody announcing themselves. Feed it to the
+    // node table, but never answer it: two nodes that each replied to a reply
+    // would ping-pong unicast packets at each other forever.
+    else if (opcode == 0x2100)
+    {
+      if (_poll_reply_cb && this_pb->len >= 108)
+      {
+        uint32_t src = (addr && IP_IS_V4(addr)) ? ip4_addr_get_u32(ip_2_ip4(addr)) : 0;
+        _poll_reply_cb((const uint8_t *)this_pb->payload, this_pb->len, src);
+      }
+      pbuf_free(this_pb);
+    }
     // ArtDMX (opcode 0x5000)
-    else if (*((uint16_t *)(this_pb->payload) + 4) == 0x5000)
+    else if (opcode == 0x5000)
     {
       // Universe is byte 14 from start (original library behaviour)
       int universe = *((uint8_t *)(this_pb->payload) + 14);
@@ -605,4 +625,51 @@ artnetESP32V2::operator bool()
 void artnetESP32V2::setNodeName(String s)
 {
   short_name = s;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Node discovery
+// ─────────────────────────────────────────────────────────────────────────────
+void artnetESP32V2::setPollReplyCallback(
+    void (*fptr)(const uint8_t *pkt, uint16_t len, uint32_t srcIp))
+{
+  _poll_reply_cb = fptr;
+}
+
+// Build and broadcast the ArtPoll inside the tcpip thread. Everything lwIP
+// touches has to happen there — sendArtPoll() is called from loop().
+static err_t _udp_sendpoll_api(struct tcpip_api_call_data *api_call_msg)
+{
+  udp_api_call_t *msg = (udp_api_call_t *)api_call_msg;
+
+  // ArtPoll: ID[8], OpCode 0x2000 (little-endian on the wire), ProtVer 14,
+  // TalkToMe 0x02 (reply on change), DiagPriority 0x10 (low).
+  static const uint8_t poll[14] = {
+    'A', 'r', 't', '-', 'N', 'e', 't', 0x00,
+    0x00, 0x20, 0x00, 0x0E, 0x02, 0x10
+  };
+
+  pbuf *pb = pbuf_alloc(PBUF_TRANSPORT, sizeof(poll), PBUF_RAM);
+  if (!pb)
+  {
+    msg->err = ERR_MEM;
+    return msg->err;
+  }
+  memcpy(pb->payload, poll, sizeof(poll));
+
+  ip_set_option(msg->pcb, SOF_BROADCAST);
+  msg->err = udp_sendto(msg->pcb, pb, IP_ADDR_BROADCAST, DEFAULT_PORT);
+  pbuf_free(pb);
+  return msg->err;
+}
+
+bool artnetESP32V2::sendArtPoll()
+{
+  if (!_pcb) return false;
+
+  udp_api_call_t msg;
+  msg.pcb = _pcb;
+  msg.err = ERR_OK;
+  tcpip_api_call(_udp_sendpoll_api, (struct tcpip_api_call_data *)&msg);
+  return msg.err == ERR_OK;
 }
