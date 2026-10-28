@@ -8,26 +8,35 @@ extern "C"
 #include "lwip/inet.h"
 #include "lwip/udp.h"
 #include "lwip/igmp.h"
+#include "lwip/ip.h"
 #include "lwip/ip_addr.h"
+#include "lwip/netif.h"
+#include "lwip/sys.h"
 #include "lwip/mld6.h"
 #include "lwip/prot/ethernet.h"
 #include <esp_err.h>
-#include <esp_wifi.h>
 }
 
 #include "lwip/priv/tcpip_priv.h"
 
 #include "artpoll.h"
-#define BUFFER_SIZE   10
-#define ART_DMX_START 18
-#define NB_MAX_BUFFER 10
-#define MAX_SUBARTNET 20
-
-#define SUBARTNET_CORE 0
-#define CALLBACK_CORE  1
 
 #define UDP_MUTEX_LOCK()
 #define UDP_MUTEX_UNLOCK()
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Module state. Lives here, not in the header, so there is exactly one copy.
+// ─────────────────────────────────────────────────────────────────────────────
+ArtnetStats artnetStats = {0, 0, 0, 0, 0, 0, 0};
+
+static QueueHandle_t            _show_queue[MAX_SUBARTNET];
+static QueueHandle_t            _udp_queue       = NULL;
+static volatile TaskHandle_t    _udp_task_handle = NULL;
+
+// Set by the sketch to receive ArtPollReply packets for node discovery.
+// Invoked from the lwIP receive context — handlers must be short and must not
+// block or write to Serial.
+static void (*_poll_reply_cb)(const uint8_t *pkt, uint16_t len, uint32_t srcIp) = NULL;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Low-level tcpip_api_call helpers (unchanged from original)
@@ -108,73 +117,134 @@ static err_t _udp_bind(struct udp_pcb *pcb, const ip_addr_t *addr, u16_t port)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Shared queue post helper — used by both ArtNet and sACN receive callbacks
+// Receive-side helpers. Everything in this section runs on the lwIP tcpip
+// task, so it has to be short and must not log, allocate or block.
 // ─────────────────────────────────────────────────────────────────────────────
-static bool _udp_task_post(pbuf *pb, int universe, bool isSacn = false)
+
+// Hand a packet to the assembly task. Never frees the pbuf: on false the
+// caller still owns it and frees it exactly once.
+static bool _udp_task_post(const lwip_event_packet_t *e)
 {
   if (!_udp_task_handle || !_udp_queue) return false;
+  return xQueueSend(_udp_queue, e, 0) == pdPASS;
+}
 
-  lwip_event_packet_t e;
-  e.pb       = pb;
-  e.universe = universe;
-  e.isSacn   = isSacn;
+static inline uint32_t _src_ip(const ip_addr_t *addr)
+{
+  return (addr && IP_IS_V4(addr)) ? ip4_addr_get_u32(ip_2_ip4(addr)) : 0;
+}
 
-  // Do not block the UDP receive callback; if the queue is full, drop packets.
-  if (xQueueSend(_udp_queue, &e, 0) != pdPASS)
-  {
-    ESP_LOGW("ARTNETESP32", "UDP queue full, dropping packet universe=%d len=%u",
-             universe, pb ? pb->len : 0);
-    if (pb) pbuf_free(pb);
+// One sender per patch. Returns false when a different sender is still
+// holding the patch.
+static inline bool _source_allowed(subArtnet *s, uint32_t src, uint32_t now)
+{
+  if (s->lockIp && s->lockIp != src && (now - s->lockMs) < ARTNET_SOURCE_LOCK_MS)
     return false;
-  }
+  s->lockIp = src;
+  s->lockMs = now;
   return true;
 }
 
-// Set by the sketch to receive ArtPollReply packets for node discovery.
-// Invoked from the lwIP receive context — handlers must be short and must not
-// block or write to Serial.
-static void (*_poll_reply_cb)(const uint8_t *pkt, uint16_t len, uint32_t srcIp) = NULL;
-
 // ─────────────────────────────────────────────────────────────────────────────
-// ArtNet receive callback (port 6454)
+// Art-Net receive callback (port 6454)
 // ─────────────────────────────────────────────────────────────────────────────
 static void _udp_recv(void *arg, udp_pcb *pcb, pbuf *pb,
                       const ip_addr_t *addr, uint16_t port)
 {
+  artnetESP32V2 *self = (artnetESP32V2 *)arg;
+
   while (pb != NULL)
   {
     pbuf *this_pb = pb;
     pb             = pb->next;
     this_pb->next  = NULL;
 
-    // Opcode sits at bytes 8-9, little-endian, straight after the 8-byte ID.
-    uint16_t opcode = *((uint16_t *)(this_pb->payload) + 4);
+    const uint8_t *p = (const uint8_t *)this_pb->payload;
 
-    // ArtPoll (0x2000) — a controller or another node asking who is here
-    if (opcode == 0x2000)
+    // Anything that is not an Art-Net packet is dropped before it costs a
+    // queue slot or a task wake-up. The ID includes its terminating NUL.
+    if (this_pb->len < 12 || memcmp(p, "Art-Net", 8) != 0)
     {
-      poll_reply(pcb, addr);
+      artnetStats.malformed++;
       pbuf_free(this_pb);
+      continue;
     }
-    // ArtPollReply (0x2100) — somebody announcing themselves. Feed it to the
-    // node table, but never answer it: two nodes that each replied to a reply
-    // would ping-pong unicast packets at each other forever.
-    else if (opcode == 0x2100)
+
+    uint16_t opcode = p[8] | ((uint16_t)p[9] << 8);
+
+    if (opcode == 0x5000)                      // ArtDMX
     {
-      if (_poll_reply_cb && this_pb->len >= 108)
+      if (this_pb->len < ART_DMX_START + 1)
       {
-        uint32_t src = (addr && IP_IS_V4(addr)) ? ip4_addr_get_u32(ip_2_ip4(addr)) : 0;
-        _poll_reply_cb((const uint8_t *)this_pb->payload, this_pb->len, src);
+        artnetStats.malformed++;
+        pbuf_free(this_pb);
+        continue;
+      }
+
+      // Full 15-bit port address: Net (bits 8-14), Sub-Net and Universe.
+      int universe = p[14] | ((p[15] & 0x7F) << 8);
+
+      subArtnet *s = self->findSubArtnet(universe);
+      if (!s)
+      {
+        artnetStats.foreign++;
+        pbuf_free(this_pb);
+        continue;
+      }
+
+      if (!_source_allowed(s, _src_ip(addr), sys_now()))
+      {
+        artnetStats.locked++;
+        pbuf_free(this_pb);
+        continue;
+      }
+
+      // Length is bounded three ways: what the sender declared, what is
+      // actually in the packet, and what the patch has room for.
+      uint16_t declared = ((uint16_t)p[16] << 8) | p[17];
+      uint16_t avail    = this_pb->len - ART_DMX_START;
+      uint16_t n        = declared < avail ? declared : avail;
+      if (n > (uint16_t)s->nbDataPerUniverse) n = (uint16_t)s->nbDataPerUniverse;
+      if (n == 0)
+      {
+        artnetStats.malformed++;
+        pbuf_free(this_pb);
+        continue;
+      }
+
+      lwip_event_packet_t e;
+      e.pb       = this_pb;
+      e.sub      = s;
+      e.dmx      = p + ART_DMX_START;
+      e.len      = n;
+      e.universe = universe;
+      e.isSacn   = false;
+
+      if (_udp_task_post(&e)) artnetStats.dmx++;
+      else { artnetStats.queueFull++; pbuf_free(this_pb); }
+    }
+    else if (opcode == 0x2000)                 // ArtPoll
+    {
+      // One broadcast reply serves every device that polled in the window,
+      // so a burst of in-phase polls costs one reply, not one per poller.
+      static uint32_t lastReply = 0;
+      uint32_t now = sys_now();
+      artnetStats.polls++;
+      if (now - lastReply >= ARTNET_POLLREPLY_MIN_MS)
+      {
+        lastReply = now;
+        poll_reply(pcb);
       }
       pbuf_free(this_pb);
     }
-    // ArtDMX (opcode 0x5000)
-    else if (opcode == 0x5000)
+    else if (opcode == 0x2100)                 // ArtPollReply
     {
-      // Universe is byte 14 from start (original library behaviour)
-      int universe = *((uint8_t *)(this_pb->payload) + 14);
-      if (!_udp_task_post(this_pb, universe))
-        pbuf_free(this_pb);
+      // Feed the node table, but never answer: two nodes that each replied
+      // to a reply would ping-pong packets at each other forever.
+      artnetStats.pollReplies++;
+      if (_poll_reply_cb && this_pb->len >= 108)
+        _poll_reply_cb(p, this_pb->len, _src_ip(addr));
+      pbuf_free(this_pb);
     }
     else
     {
@@ -188,128 +258,180 @@ static void _udp_recv(void *arg, udp_pcb *pcb, pbuf *pb,
 //
 // E1.31 packet layout (relevant offsets):
 //   0-1   : Preamble size (0x0010)
-//   2-3   : Postamble size (0x0000)
-//   4-15  : ACN Packet Identifier UUID
-//  16-17  : PDU flags+length
-//  18-21  : Vector (0x00000004 = E1.31 Data Packet)
-//  22-83  : Source name (64 bytes)
-//  84     : Priority
-//  85-86  : Synchronization address
-//  87     : Sequence number
-//  88     : Options
-//  89-90  : Universe (big-endian, 1-based)  <-- CORRECTED offset
-//  -- DMP Layer begins at 91 --
-//  91-92  : Flags+length
-//  93     : Vector (0x02)
-//  94     : Address type / data type (0xa1)
-//  95-96  : First property address (0x0000)
-//  97-98  : Address increment (0x0001)
-//  99-100 : Property count (big-endian, includes start code)
-//  101    : DMX Start Code (0x00)
-//  102+   : DMX payload (up to 512 bytes)
-//
-// Total header before DMX payload: 102 bytes (start code at 101, data at 102).
-// We define SACN_HEADER_SIZE = 126 to be conservative and match common
-// implementations; the actual DMX data starts at offset 126 in standard
-// E1.31 frames.  For the universe we use offsets 113/114 (within the
-// standard framing layer) which is the most widely documented position.
-//
-// NOTE: The universe offset depends on the preamble. Standard E1.31 frames
-// always use preamble 0x0010, making the universe reliably at bytes 113-114.
+//   4-15  : ACN Packet Identifier
+//  18-21  : Root vector (0x00000004 = E1.31 data)
+//  40-43  : Framing vector (0x00000002 = DMP)
+//  99-100 : Property count (big-endian, includes the start code)
+//  113-114: Universe (big-endian, 1-based)
+//  125    : DMX start code (0x00 for level data)
+//  126+   : DMX payload (up to 512 bytes)
 // ─────────────────────────────────────────────────────────────────────────────
 static void _sacn_recv(void *arg, udp_pcb *pcb, pbuf *pb,
                        const ip_addr_t *addr, uint16_t port)
 {
+  artnetESP32V2 *self = (artnetESP32V2 *)arg;
+
   while (pb != NULL)
   {
     pbuf *this_pb = pb;
     pb             = pb->next;
     this_pb->next  = NULL;
 
-    // Minimum length check
-    if (this_pb->len < SACN_HEADER_SIZE)
+    const uint8_t *p = (const uint8_t *)this_pb->payload;
+
+    if (this_pb->len < SACN_HEADER_SIZE + 1)
     {
-      ESP_LOGI("ARTNETESP32", "sACN RX too short (%u bytes)", this_pb->len);
+      artnetStats.malformed++;
       pbuf_free(this_pb);
       continue;
     }
 
-    uint8_t *p = (uint8_t *)this_pb->payload;
-
-    // Verify E1.31 root and framing vectors
     uint32_t rootVector = ((uint32_t)p[SACN_ROOT_VECTOR_OFFSET] << 24) |
                           ((uint32_t)p[SACN_ROOT_VECTOR_OFFSET + 1] << 16) |
                           ((uint32_t)p[SACN_ROOT_VECTOR_OFFSET + 2] << 8) |
                           p[SACN_ROOT_VECTOR_OFFSET + 3];
-    if (rootVector != SACN_ROOT_VECTOR_VAL)
-    {
-      ESP_LOGI("ARTNETESP32", "sACN RX bad root vector 0x%08x len=%u", rootVector, this_pb->len);
-      pbuf_free(this_pb);
-      continue;
-    }
-
     uint32_t framingVector = ((uint32_t)p[SACN_FRAMING_VECTOR_OFFSET] << 24) |
                              ((uint32_t)p[SACN_FRAMING_VECTOR_OFFSET + 1] << 16) |
                              ((uint32_t)p[SACN_FRAMING_VECTOR_OFFSET + 2] << 8) |
                              p[SACN_FRAMING_VECTOR_OFFSET + 3];
-    if (framingVector != SACN_FRAMING_VECTOR_VAL)
+
+    // Only level data with the null start code drives the strips. Priority
+    // packets (start code 0xDD) are ignored.
+    if (rootVector != SACN_ROOT_VECTOR_VAL || framingVector != SACN_FRAMING_VECTOR_VAL ||
+        p[SACN_START_CODE] != 0x00)
     {
-      ESP_LOGI("ARTNETESP32", "sACN RX bad framing vector 0x%08x len=%u", framingVector, this_pb->len);
+      artnetStats.malformed++;
       pbuf_free(this_pb);
       continue;
     }
 
-    // Universe: big-endian at offsets 113-114, 1-based in E1.31
-    uint16_t universe = ((uint16_t)p[SACN_UNIVERSE_HIGH] << 8) |
-                         p[SACN_UNIVERSE_LOW];
-
-    // Normalise to 0-based to match ArtNet convention used throughout the
-    // rest of the library (startUniverse 0 in ArtNet == universe 1 in sACN)
-    if (universe == 0)
+    // 1-based on the wire; the library counts universes from 0 like Art-Net.
+    uint16_t wireUniverse = ((uint16_t)p[SACN_UNIVERSE_HIGH] << 8) | p[SACN_UNIVERSE_LOW];
+    if (wireUniverse == 0)
     {
-      // Universe 0 is invalid in E1.31 — discard
-      ESP_LOGI("ARTNETESP32", "sACN RX invalid universe 0 len=%u", this_pb->len);
+      artnetStats.malformed++;
       pbuf_free(this_pb);
       continue;
     }
-    int normalisedUniverse = (int)universe - 1;
+    int universe = (int)wireUniverse - 1;
 
-    // Safety: single-pbuf only (sACN frames are always < MTU)
-    if (this_pb->next != NULL)
+    subArtnet *s = self->findSubArtnet(universe);
+    if (!s)
     {
-      // Chained pbuf — unexpected, discard
-      ESP_LOGI("ARTNETESP32", "sACN RX chained pbuf len=%u", this_pb->len);
+      artnetStats.foreign++;
       pbuf_free(this_pb);
       continue;
     }
 
-    const char *src = ipaddr_ntoa(addr);
-    ESP_LOGI("ARTNETESP32", "sACN RX from %s:%u raw=%u universe=%u norm=%d",
-             src ? src : "?", port, this_pb->len, universe,
-             normalisedUniverse);
-
-    // Advance payload pointer past the E1.31 header so the downstream
-    // handler sees raw DMX data, matching what the ArtNet path delivers.
-    // We must not call pbuf_free after adjusting payload — lwIP still owns
-    // the original allocation; we just adjust the pointer.
-    this_pb->payload  = p + SACN_HEADER_SIZE;
-    this_pb->len      = (this_pb->len > SACN_HEADER_SIZE)
-                        ? (this_pb->len - SACN_HEADER_SIZE) : 0;
-    this_pb->tot_len  = this_pb->len;
-
-    if (this_pb->len == 0)
+    if (!_source_allowed(s, _src_ip(addr), sys_now()))
     {
-      ESP_LOGI("ARTNETESP32", "sACN RX no DMX data after header");
+      artnetStats.locked++;
       pbuf_free(this_pb);
       continue;
     }
 
-    if (!_udp_task_post(this_pb, normalisedUniverse, true))
+    // Property count includes the start code, so the payload is one less.
+    uint16_t props    = ((uint16_t)p[SACN_PROP_COUNT] << 8) | p[SACN_PROP_COUNT + 1];
+    uint16_t declared = props ? props - 1 : 0;
+    uint16_t avail    = this_pb->len - SACN_HEADER_SIZE;
+    uint16_t n        = declared < avail ? declared : avail;
+    if (n > (uint16_t)s->nbDataPerUniverse) n = (uint16_t)s->nbDataPerUniverse;
+    if (n == 0)
     {
-      ESP_LOGI("ARTNETESP32", "sACN RX failed to post universe=%d len=%u",
-              normalisedUniverse, this_pb->len);
+      artnetStats.malformed++;
       pbuf_free(this_pb);
+      continue;
     }
+
+    lwip_event_packet_t e;
+    e.pb       = this_pb;
+    e.sub      = s;
+    e.dmx      = p + SACN_HEADER_SIZE;
+    e.len      = n;
+    e.universe = universe;
+    e.isSacn   = true;
+
+    if (_udp_task_post(&e)) artnetStats.dmx++;
+    else { artnetStats.queueFull++; pbuf_free(this_pb); }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Frame assembly (runs on the assembly task)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Ship the frame being built and start the next one.
+void subArtnet::flushFrame()
+{
+  uint8_t *d = buffers[currentframenumber];
+
+  // Where this frame ended tells the next one when it is complete, for a
+  // sender that patched fewer universes than we did.
+  if (highestSeenThisFrame >= 0) observedEnd = highestSeenThisFrame;
+  highestSeenThisFrame = -1;
+  rxMask     = 0;
+  assembling = false;
+
+  currentframenumber = (currentframenumber + 1) % nbOfBuffers;
+
+  if (_using_queues)
+  {
+    if (xQueueSend(_show_queue[subArtnetNum], &d, 0) != pdTRUE) nb_frames_lost++;
+  }
+  else
+  {
+    data = d;
+    nb_frames++;
+    if (frameCallback) frameCallback((void *)this);
+  }
+}
+
+// Each universe is written at its own offset, so order does not matter and
+// a lost universe only leaves its slice one frame stale: the new frame is
+// seeded from the previous one, so every slice always holds the latest
+// value that arrived for it.
+void subArtnet::handleUniverse(lwip_event_packet_t *e)
+{
+  int idx = e->universe - startUniverse;
+  if (idx < 0 || idx >= nbNeededUniverses) return;
+  uint32_t bit = 1UL << idx;
+
+  // The same universe twice means the sender has moved on to the next
+  // frame. Ship what we have rather than wait for packets that were lost.
+  if (assembling && (rxMask & bit))
+  {
+    nb_frames_partial++;
+    flushFrame();
+  }
+
+  if (!assembling)
+  {
+    assembling = true;
+    rxMask     = 0;
+    if (nbOfBuffers > 1)
+      memcpy(buffers[currentframenumber],
+             buffers[(currentframenumber + nbOfBuffers - 1) % nbOfBuffers],
+             frameBytes);
+  }
+
+  memcpy(buffers[currentframenumber] + (size_t)idx * nbDataPerUniverse, e->dmx, e->len);
+  rxMask |= bit;
+  if (idx > highestSeenThisFrame) highestSeenThisFrame = idx;
+
+  // Complete: every patched universe is in.
+  if (rxMask == fullMask)
+  {
+    flushFrame();
+    return;
+  }
+
+  // Adaptive end: the sender patched fewer universes than we did, so the
+  // frame is complete when the universe that ended the previous frame
+  // arrives and everything below it is already in.
+  if (idx == observedEnd)
+  {
+    uint32_t need = (observedEnd >= 31) ? 0xFFFFFFFFUL : ((1UL << (observedEnd + 1)) - 1);
+    if ((rxMask & need) == need) flushFrame();
   }
 }
 
@@ -324,77 +446,167 @@ subArtnet::subArtnet(int star_universe, uint32_t nb_data,
 
 void subArtnet::createBuffers(uint8_t *leds)
 {
+  size_t bytes = frameBytes + 8 + BUFFER_SIZE;
+  nbOfBuffers  = 0;
+
   for (int buffnum = 0; buffnum < NB_MAX_BUFFER; buffnum++)
   {
-    buffers[buffnum] = (uint8_t *)calloc(
-        (nbDataPerUniverse) * nbNeededUniverses + 8 + BUFFER_SIZE, 1);
-
+    buffers[buffnum] = (uint8_t *)calloc(bytes, 1);
     if (buffers[buffnum] == NULL)
     {
-      ESP_LOGI("ARTNETESP32", "impossible to create buffer %d", buffnum);
-      if (leds != NULL)
+      ESP_LOGW("ARTNETESP32", "frame buffer %d: out of heap", buffnum);
+      if (leds != NULL && buffnum == 0)
       {
-        buffers[buffnum] = leds;
-        ESP_LOGI("ARTNETESP32", "using leds array as buffer %d", buffnum);
-        nbOfBuffers = buffnum + 1;
-        return;
+        buffers[0]  = leds;
+        nbOfBuffers = 1;
       }
-      else
-      {
-        nbOfBuffers = buffnum;
-        ESP_LOGI("ARTNETESP32", "nb total of buffers:%d", nbOfBuffers);
-        return;
-      }
+      break;
     }
-    else
-    {
-      ESP_LOGI("ARTNETESP32", "Creation of buffer %d", buffnum);
-      nbOfBuffers = buffnum + 1;
-    }
-    memset(buffers[buffnum], 0,
-           (nbDataPerUniverse) * nbNeededUniverses + 8 + BUFFER_SIZE);
+    nbOfBuffers = buffnum + 1;
   }
-  ESP_LOGI("ARTNETESP32", "nb total of buffers:%d", nbOfBuffers);
+  ESP_LOGI("ARTNETESP32", "frame buffers: %d x %u bytes", nbOfBuffers, (unsigned)bytes);
 }
 
 void subArtnet::_initialize(int star_universe, uint32_t nb_data,
                             uint32_t nb_data_per_universe, uint8_t *leds)
 {
-  nb_frames          = 0;
-  nb_frame_double    = 0;
-  nb_frames_lost     = 0;
-  previous_lost      = 0;
-  previousUniverse   = 99;
-  new_frame          = false;
-  _nb_data           = nb_data;
-  nbDataPerUniverse  = nb_data_per_universe;
-  startUniverse      = star_universe;
-  // Sentinels — never match a real incoming universe
-  observedEnd          = star_universe - 1;
-  highestSeenThisFrame = star_universe - 1;
+  nb_frames         = 0;
+  nb_frame_double   = 0;
+  nb_frames_lost    = 0;
+  nb_frames_partial = 0;
+  previous_lost     = 0;
+  _nb_data          = nb_data;
+  nbDataPerUniverse = nb_data_per_universe;
+  startUniverse     = star_universe;
   nbNeededUniverses = nb_data / nbDataPerUniverse;
-  if (nbNeededUniverses * nbDataPerUniverse < nb_data)
-    nbNeededUniverses++;
-  len        = nb_data;
+  if (nbNeededUniverses * nbDataPerUniverse < nb_data) nbNeededUniverses++;
+  if (nbNeededUniverses > MAX_UNIVERSES_PER_PATCH)
+  {
+    ESP_LOGW("ARTNETESP32", "patch of %d universes clamped to %d",
+             nbNeededUniverses, MAX_UNIVERSES_PER_PATCH);
+    nbNeededUniverses = MAX_UNIVERSES_PER_PATCH;
+  }
+  len         = nb_data;
   endUniverse = startUniverse + nbNeededUniverses;
+  frameBytes  = (size_t)nbDataPerUniverse * nbNeededUniverses;
+
+  rxMask               = 0;
+  fullMask             = (nbNeededUniverses >= 32) ? 0xFFFFFFFFUL
+                                                   : ((1UL << nbNeededUniverses) - 1);
+  assembling           = false;
+  observedEnd          = nbNeededUniverses - 1;
+  highestSeenThisFrame = -1;
+  lockIp               = 0;
+  lockMs               = 0;
+  data                 = NULL;
 
   ESP_LOGI("ARTNETESP32",
            "Initialize subArtnet Start Universe: %d  end Universe: %d, universes %d",
            startUniverse, endUniverse - 1, nbNeededUniverses);
   createBuffers(leds);
   currentframenumber = 0;
-  offset             = buffers[0];
 }
 
 subArtnet::~subArtnet()
 {
-  if (buffers[0] != NULL) free(buffers[0]);
-  if (buffers[1] != NULL) free(buffers[1]);
+  for (int i = 0; i < nbOfBuffers; i++)
+    if (buffers[i] != NULL) free(buffers[i]);
 }
 
 uint8_t *subArtnet::getData()
 {
   return data;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Assembly task: takes packets off _udp_queue and writes them into frames
+// ─────────────────────────────────────────────────────────────────────────────
+static void _udp_task_subrarnet(void *pvParameters)
+{
+  lwip_event_packet_t e;
+  artnetESP32V2 *artnet = (artnetESP32V2 *)pvParameters;
+
+  for (int i = 0; i < artnet->numSubArtnet; i++)
+  {
+    subArtnet *s = artnet->subArtnets[i];
+    ESP_LOGI("ARTNETESP32", "subArtnet nr:%d start universe:%d Nb Universes: %d",
+             s->subArtnetNum, s->startUniverse, s->nbNeededUniverses);
+  }
+
+  for (;;)
+  {
+    if (xQueueReceive(_udp_queue, &e, portMAX_DELAY) == pdTRUE)
+    {
+      if (!e.pb) continue;
+      if (e.sub) e.sub->handleUniverse(&e);
+      pbuf_free(e.pb);
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-patch LED task: newest frame wins
+// ─────────────────────────────────────────────────────────────────────────────
+static void _udp_task_subrarnet_handle(void *pvParameters)
+{
+  subArtnet *subartnet = (subArtnet *)pvParameters;
+  uint8_t   *data      = NULL;
+  QueueHandle_t q      = _show_queue[subartnet->subArtnetNum];
+
+  for (;;)
+  {
+    if (xQueueReceive(q, &data, portMAX_DELAY) == pdTRUE)
+    {
+      // If the strips fell behind, skip straight to the newest frame instead
+      // of playing a backlog. Frames are seeded, so nothing is lost by it.
+      uint8_t *newer;
+      while (xQueueReceive(q, &newer, 0) == pdTRUE)
+      {
+        data = newer;
+        subartnet->nb_frame_double++;
+      }
+
+      subartnet->data = data;
+      subartnet->nb_frames++;
+      if (subartnet->frameCallback) subartnet->frameCallback((void *)subartnet);
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Queue / task startup (called from listen())
+// ─────────────────────────────────────────────────────────────────────────────
+static bool _udp_task_start(artnetESP32V2 *p)
+{
+  if (!_udp_queue)
+  {
+    _udp_queue = xQueueCreate(128, sizeof(lwip_event_packet_t));
+    if (!_udp_queue) return false;
+  }
+  for (int i = 0; i < p->numSubArtnet; i++)
+  {
+    if (!_show_queue[i])
+    {
+      _show_queue[i] = xQueueCreate(NB_MAX_BUFFER, sizeof(uint8_t *));
+      if (!_show_queue[i])
+      {
+        ESP_LOGE("ARTNETESP32", "show queue %d not created", i);
+        return false;
+      }
+    }
+  }
+  if (!_udp_task_handle)
+  {
+    xTaskCreateUniversal(_udp_task_subrarnet, "_udp_task_subrarnet", 4096, p,
+                         CONFIG_ARDUINO_UDP_TASK_PRIORITY,
+                         (TaskHandle_t *)&_udp_task_handle, SUBARTNET_CORE);
+    if (!_udp_task_handle)
+    {
+      ESP_LOGE("ARTNETESP32", "assembly task not created");
+      return false;
+    }
+  }
+  return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -408,7 +620,6 @@ artnetESP32V2::artnetESP32V2()
   _lastErr   = ERR_OK;
 }
 
-// ── Init ArtNet PCB ───────────────────────────────────────────────────────────
 bool artnetESP32V2::_init()
 {
   if (_pcb) return true;
@@ -418,10 +629,9 @@ bool artnetESP32V2::_init()
   return true;
 }
 
-// ── Init sACN PCB ─────────────────────────────────────────────────────────────
 bool artnetESP32V2::_initSACN()
 {
-  if (_sacn_pcb) return true;   // already initialised
+  if (_sacn_pcb) return true;
 
   _sacn_pcb = udp_new();
   if (!_sacn_pcb)
@@ -449,38 +659,22 @@ bool artnetESP32V2::_initSACN()
   return true;
 }
 
-// ── Multicast join helper ─────────────────────────────────────────────────────
-// sACN multicast address for universe N is 239.255.(N>>8).(N&0xFF).
-// N is the 1-based sACN universe (= ArtNet universe + 1 internally).
+// sACN multicast address for universe N is 239.255.(N>>8).(N&0xFF), with N
+// the 1-based sACN universe (= library universe + 1).
 void artnetESP32V2::joinSACNMulticast(int startUniverse, int numUniverses)
 {
-  if (protocolMode == PROTOCOL_ARTNET) return;  // sACN not active
+  if (protocolMode == PROTOCOL_ARTNET) return;
 
   for (int i = 0; i < numUniverses; i++)
   {
-    int sacnUniverse = startUniverse + i + 1;   // +1: ArtNet->sACN 1-based
+    int sacnUniverse = startUniverse + i + 1;
     ip4_addr_t mcast;
-    IP4_ADDR(&mcast,
-             239, 255,
-             (sacnUniverse >> 8) & 0xFF,
-             sacnUniverse & 0xFF);
+    IP4_ADDR(&mcast, 239, 255, (sacnUniverse >> 8) & 0xFF, sacnUniverse & 0xFF);
 
     if (igmp_joingroup(IP4_ADDR_ANY4, &mcast) != ERR_OK)
-    {
-      ESP_LOGW("ARTNETESP32",
-               "igmp_joingroup failed for universe %d (239.255.%d.%d)",
-               sacnUniverse,
-               (sacnUniverse >> 8) & 0xFF,
-               sacnUniverse & 0xFF);
-    }
+      ESP_LOGW("ARTNETESP32", "igmp_joingroup failed for sACN universe %d", sacnUniverse);
     else
-    {
-      ESP_LOGI("ARTNETESP32",
-               "Joined sACN multicast 239.255.%d.%d for universe %d",
-               (sacnUniverse >> 8) & 0xFF,
-               sacnUniverse & 0xFF,
-               sacnUniverse);
-    }
+      ESP_LOGI("ARTNETESP32", "Joined sACN multicast for universe %d", sacnUniverse);
   }
 }
 
@@ -511,7 +705,6 @@ void artnetESP32V2::close()
     if (_connected) _udp_disconnect(_pcb);
     _connected = false;
   }
-  // _sacn_pcb uses bind (not connect), so no disconnect needed
   UDP_MUTEX_UNLOCK();
 }
 
@@ -548,20 +741,18 @@ bool artnetESP32V2::listen(const ip_addr_t *addr, uint16_t port)
 {
   if (!_udp_task_start(this)) { log_e("failed to start task"); return false; }
 
-  char mess[60];
+  char mess[32];
   for (int i = 0; i < numSubArtnet; i++)
   {
     if (subArtnets[i]->_using_queues)
     {
-      memset(mess, 0, 60);
-      sprintf(mess, "handle_subartnet_%d", i);
+      snprintf(mess, sizeof(mess), "handle_subartnet_%d", i);
       subArtnets[i]->subArtnet_sem = xSemaphoreCreateBinary();
       xTaskCreateUniversal(_udp_task_subrarnet_handle, mess, 4096,
                            subArtnets[i], 3, NULL, CALLBACK_CORE);
     }
   }
 
-  // ── ArtNet PCB ─────────────────────────────────────────────────────────────
   if (protocolMode != PROTOCOL_SACN)
   {
     if (!_init()) return false;
@@ -582,15 +773,10 @@ bool artnetESP32V2::listen(const ip_addr_t *addr, uint16_t port)
     ESP_LOGI("ARTNETESP32", "ArtNet listening on port %d", port);
   }
 
-  // ── sACN PCB ───────────────────────────────────────────────────────────────
   if (protocolMode != PROTOCOL_ARTNET)
   {
     if (!_initSACN())
-    {
-      // Non-fatal if ArtNet is also active; log and continue
-      ESP_LOGW("ARTNETESP32",
-               "sACN init failed — continuing with ArtNet only");
-    }
+      ESP_LOGW("ARTNETESP32", "sACN init failed — continuing with ArtNet only");
   }
 
   return true;

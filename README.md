@@ -39,10 +39,13 @@ Here is what I use in my tests
   - to compile : `gcc udpsend.c -o udpsend`
   - usage *udpsend delay_between_universes_in_microseconds fps nb_of_universes ip_address* : `udpsend 100 40 35 192.168.0.11`
   - this will send 35 universes @ 40fps to the ip address 192.168.0.11 with 100us(0.1ms) between universes
-  - do not forget to activate the debug level to 'Info'
+
+## Statistics
+   * Build with 'Tools>Core Debug Level>>None' for a show. Nothing in the receive path logs any more; it counts instead.
+   * Read `artnetStats` (packets accepted, foreign, locked, malformed, queue full, polls, poll replies) and the per-patch `nb_frames`, `nb_frames_partial`, `nb_frame_double` (skipped) and `nb_frames_lost` from your sketch and print them at your own pace.
+   * 'Info' adds the library's boot-time details (buffer allocation, multicast joins).
 
 ## Other stuff
-   * If you want to get some stat please activate the info debug level 'Tools>Core Debug Level>>Info'
    * do not hesitate to contact me if any question and please let me know about your builds with my libraires
    * The code is not super clean yet so please be indulgent
    * I have tried to test as much as I can with my panel (5904 leds, 35 universes)
