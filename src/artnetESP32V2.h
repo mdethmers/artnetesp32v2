@@ -63,7 +63,7 @@ typedef struct
 #define SACN_PORT           5568
 #define SACN_HEADER_SIZE    126   // bytes before DMX payload in E1.31
 #define SACN_START_CODE     125   // DMX start code sits just before the payload
-#define SACN_PROP_COUNT     99    // big-endian property count (includes start code)
+#define SACN_PROP_COUNT     123   // big-endian property count (includes start code)
 #define SACN_UNIVERSE_HIGH  113   // big-endian universe MSB offset
 #define SACN_UNIVERSE_LOW   114   // big-endian universe LSB offset
 #define SACN_ROOT_VECTOR_OFFSET    18

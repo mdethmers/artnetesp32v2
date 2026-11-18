@@ -261,8 +261,8 @@ static void _udp_recv(void *arg, udp_pcb *pcb, pbuf *pb,
 //   4-15  : ACN Packet Identifier
 //  18-21  : Root vector (0x00000004 = E1.31 data)
 //  40-43  : Framing vector (0x00000002 = DMP)
-//  99-100 : Property count (big-endian, includes the start code)
 //  113-114: Universe (big-endian, 1-based)
+//  123-124: Property count (big-endian, includes the start code)
 //  125    : DMX start code (0x00 for level data)
 //  126+   : DMX payload (up to 512 bytes)
 // ─────────────────────────────────────────────────────────────────────────────
